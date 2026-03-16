@@ -543,3 +543,150 @@ async fn test_bridge_multiple_adapters() {
 
     manager.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// User isolation — send_message_as receives correct UserContext
+// ---------------------------------------------------------------------------
+
+/// Records UserContext passed through send_message_as, in addition to the basic echo.
+struct IsolationMockHandle {
+    agents: Vec<(AgentId, String)>,
+    /// (agent_id, message, user_context_platform_id)
+    calls: Arc<Mutex<Vec<(AgentId, String, Option<String>)>>>,
+}
+
+impl IsolationMockHandle {
+    fn new(agents: Vec<(AgentId, String)>) -> Self {
+        Self {
+            agents,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ChannelBridgeHandle for IsolationMockHandle {
+    async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push((agent_id, message.to_string(), None));
+        Ok(format!("Echo: {message}"))
+    }
+
+    async fn send_message_as(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        user_context: Option<openfang_types::agent::UserContext>,
+    ) -> Result<String, String> {
+        let pid = user_context.map(|u| u.platform_id);
+        self.calls.lock().unwrap().push((agent_id, message.to_string(), pid));
+        Ok(format!("Echo: {message}"))
+    }
+
+    async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
+        Ok(self.agents.iter().find(|(_, n)| n == name).map(|(id, _)| *id))
+    }
+
+    async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
+        Ok(self.agents.clone())
+    }
+
+    async fn spawn_agent_by_name(&self, _: &str) -> Result<AgentId, String> {
+        Err("mock: spawn not implemented".to_string())
+    }
+}
+
+/// Verify that dispatch_message calls send_message_as with the sender's
+/// platform_id as the UserContext platform_id.
+#[tokio::test]
+async fn test_bridge_passes_user_context_to_send_message_as() {
+    let agent_id = AgentId::new();
+    let handle = Arc::new(IsolationMockHandle::new(vec![(agent_id, "bot".to_string())]));
+    let router = Arc::new(AgentRouter::new());
+    router.set_user_default("alice_123".to_string(), agent_id);
+
+    let (adapter, tx) = MockAdapter::new("test-adapter", ChannelType::Telegram);
+    let mut manager = BridgeManager::new(handle.clone(), router);
+    manager.start_adapter(adapter.clone()).await.unwrap();
+
+    tx.send(make_text_msg(ChannelType::Telegram, "alice_123", "Hello!"))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let calls = handle.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "Expected exactly 1 call");
+    assert_eq!(calls[0].0, agent_id, "Agent ID mismatch");
+    assert_eq!(calls[0].1, "Hello!", "Message text mismatch");
+    assert_eq!(
+        calls[0].2.as_deref(),
+        Some("alice_123"),
+        "UserContext.platform_id should be the sender's platform_id"
+    );
+
+    drop(calls);
+    manager.stop().await;
+}
+
+/// Two different users sending to the same agent each have their own platform_id
+/// in the UserContext.
+#[tokio::test]
+async fn test_bridge_different_users_get_different_user_context() {
+    let agent_id = AgentId::new();
+    let handle = Arc::new(IsolationMockHandle::new(vec![(agent_id, "bot".to_string())]));
+    let router = Arc::new(AgentRouter::new());
+    router.set_user_default("alice".to_string(), agent_id);
+    router.set_user_default("bob".to_string(), agent_id);
+
+    let (adapter, tx) = MockAdapter::new("test-adapter", ChannelType::Telegram);
+    let mut manager = BridgeManager::new(handle.clone(), router);
+    manager.start_adapter(adapter.clone()).await.unwrap();
+
+    tx.send(make_text_msg(ChannelType::Telegram, "alice", "Hi from Alice"))
+        .await
+        .unwrap();
+    tx.send(make_text_msg(ChannelType::Telegram, "bob", "Hi from Bob"))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    let calls = handle.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+
+    let pids: Vec<&str> = calls.iter().filter_map(|c| c.2.as_deref()).collect();
+    assert!(pids.contains(&"alice"), "alice should have a UserContext");
+    assert!(pids.contains(&"bob"), "bob should have a UserContext");
+
+    drop(calls);
+    manager.stop().await;
+}
+
+/// Verify that UserContext.user_id is deterministic: same channel_type + platform_id
+/// always produces the same UUID.
+#[test]
+fn test_user_context_derives_deterministic_user_id() {
+    use openfang_types::agent::UserContext;
+
+    let uid1 = UserContext::derive_user_id("telegram", "123456");
+    let uid2 = UserContext::derive_user_id("telegram", "123456");
+    assert_eq!(uid1, uid2, "Same inputs should give same UserId");
+
+    let uid3 = UserContext::derive_user_id("discord", "123456");
+    assert_ne!(uid1, uid3, "Different channel types must produce different UserIds");
+
+    let uid4 = UserContext::derive_user_id("telegram", "999999");
+    assert_ne!(uid1, uid4, "Different platform_ids must produce different UserIds");
+}
+
+/// UserContext::new() builds the correct user_id from channel + platform_id.
+#[test]
+fn test_user_context_new_matches_derive() {
+    use openfang_types::agent::UserContext;
+
+    let ctx = UserContext::new("telegram", "777", Some("Alice".to_string()));
+    let expected = UserContext::derive_user_id("telegram", "777");
+    assert_eq!(ctx.user_id, expected);
+    assert_eq!(ctx.platform_id, "777");
+    assert_eq!(ctx.display_name, Some("Alice".to_string()));
+}
