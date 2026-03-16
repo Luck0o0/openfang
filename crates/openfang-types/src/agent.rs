@@ -38,6 +38,46 @@ impl std::str::FromStr for UserId {
     }
 }
 
+/// User identity context for per-user session isolation.
+///
+/// Carries the caller's identity through the message dispatch chain so that
+/// `SessionStore` and file sandboxes can be scoped per `(agent_id, user_id)`.
+/// When `None` is passed (e.g. direct HTTP API calls), behaviour is identical
+/// to pre-isolation — all messages share the agent's single session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserContext {
+    /// Deterministic UUID derived from `UUID::v5(channel_namespace, platform_id)`.
+    pub user_id: UserId,
+    /// The platform-specific user identifier (e.g. Telegram numeric ID, Feishu open_id).
+    pub platform_id: String,
+    /// Human-readable display name, if provided by the channel adapter.
+    pub display_name: Option<String>,
+}
+
+impl UserContext {
+    /// Derive a deterministic `UserId` for a given channel + platform_id combination.
+    ///
+    /// Uses UUID v5 (SHA-1 namespace) so the same user always gets the same ID.
+    /// Different channels (telegram vs feishu) produce different IDs even for
+    /// the same numeric platform_id — preventing cross-platform collisions.
+    pub fn derive_user_id(channel_type: &str, platform_id: &str) -> UserId {
+        // Namespace UUID for OpenFang user identity derivation.
+        const NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+            0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ]);
+        let key = format!("{channel_type}:{platform_id}");
+        UserId(uuid::Uuid::new_v5(&NAMESPACE, key.as_bytes()))
+    }
+
+    /// Construct a `UserContext` from channel type, platform ID, and optional display name.
+    pub fn new(channel_type: &str, platform_id: impl Into<String>, display_name: Option<String>) -> Self {
+        let platform_id = platform_id.into();
+        let user_id = Self::derive_user_id(channel_type, &platform_id);
+        Self { user_id, platform_id, display_name }
+    }
+}
+
 /// Model routing configuration — auto-selects cheap/mid/expensive models by complexity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
