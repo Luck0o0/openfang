@@ -12,7 +12,7 @@ use crate::types::{
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::StreamExt;
-use openfang_types::agent::AgentId;
+use openfang_types::agent::{AgentId, UserContext};
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
 use openfang_types::message::ContentBlock;
 use std::sync::Arc;
@@ -47,6 +47,33 @@ pub trait ChannelBridgeHandle: Send + Sync {
             .collect::<Vec<_>>()
             .join("\n");
         self.send_message(agent_id, &text).await
+    }
+
+    /// Send a text message on behalf of a specific user (for session isolation).
+    ///
+    /// Default implementation falls back to `send_message` — no isolation.
+    /// The kernel-backed implementation routes through `send_message_as`.
+    async fn send_message_as(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        user_context: Option<UserContext>,
+    ) -> Result<String, String> {
+        let _ = user_context;
+        self.send_message(agent_id, message).await
+    }
+
+    /// Send content blocks on behalf of a specific user (for session isolation).
+    ///
+    /// Default implementation falls back to `send_message_with_blocks` — no isolation.
+    async fn send_message_with_blocks_as(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<ContentBlock>,
+        user_context: Option<UserContext>,
+    ) -> Result<String, String> {
+        let _ = user_context;
+        self.send_message_with_blocks(agent_id, blocks).await
     }
 
     /// Find an agent by name, returning its ID.
@@ -891,7 +918,12 @@ async fn dispatch_message(
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
     // Send to agent and relay response
-    let result = handle.send_message(agent_id, &text).await;
+    let user_ctx = Some(UserContext::new(
+        ct_str,
+        sender_user_id(message),
+        Some(message.sender.display_name.clone()),
+    ));
+    let result = handle.send_message_as(agent_id, &text, user_ctx).await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -917,7 +949,12 @@ async fn dispatch_message(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message(new_id, &text).await;
+                let retry_ctx = Some(UserContext::new(
+                    ct_str,
+                    sender_user_id(message),
+                    Some(message.sender.display_name.clone()),
+                ));
+                let retry = handle.send_message_as(new_id, &text, retry_ctx).await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {
@@ -1287,8 +1324,13 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
+    let user_ctx = Some(UserContext::new(
+        ct_str,
+        sender_user_id(message),
+        Some(message.sender.display_name.clone()),
+    ));
     let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
+        .send_message_with_blocks_as(agent_id, blocks.clone(), user_ctx)
         .await;
 
     typing_task.abort();
@@ -1314,7 +1356,12 @@ async fn dispatch_with_blocks(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message_with_blocks(new_id, blocks).await;
+                let retry_ctx = Some(UserContext::new(
+                    ct_str,
+                    sender_user_id(message),
+                    Some(message.sender.display_name.clone()),
+                ));
+                let retry = handle.send_message_with_blocks_as(new_id, blocks, retry_ctx).await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {

@@ -108,6 +108,50 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(result.response)
     }
 
+    async fn send_message_as(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        user_context: Option<openfang_types::agent::UserContext>,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_as(agent_id, message, user_context)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        if result.silent {
+            return Ok(String::new());
+        }
+        Ok(result.response)
+    }
+
+    async fn send_message_with_blocks_as(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        user_context: Option<openfang_types::agent::UserContext>,
+    ) -> Result<String, String> {
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                openfang_types::message::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "[Image]".to_string()
+        } else {
+            text
+        };
+        let result = self
+            .kernel
+            .send_message_with_blocks_as(agent_id, &text, blocks, user_context)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }
