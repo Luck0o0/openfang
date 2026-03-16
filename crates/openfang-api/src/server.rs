@@ -690,6 +690,16 @@ pub async fn build_router(
         )
         // MCP HTTP endpoint (exposes MCP protocol over HTTP)
         .route("/mcp", axum::routing::post(routes::mcp_http))
+        // Organization management API
+        .route("/api/org", axum::routing::get(routes::list_orgs))
+        .route(
+            "/api/org/templates",
+            axum::routing::get(routes::list_agent_templates),
+        )
+        .route(
+            "/api/org/agents",
+            axum::routing::post(routes::create_org_agent),
+        )
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",

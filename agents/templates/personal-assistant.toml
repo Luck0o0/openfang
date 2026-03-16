@@ -1,0 +1,29 @@
+name = "personal-assistant"
+version = "1.0.0"
+description = "Personal assistant — scheduling, reminders, email drafting, and task tracking."
+author = "openfang"
+module = "builtin:chat"
+tags = ["personal", "assistant", "productivity", "template"]
+template_skills = ["calendar", "reminder"]
+
+[model]
+provider = "default"
+model = "default"
+max_tokens = 4096
+temperature = 0.5
+system_prompt = """You are a personal assistant. You help with scheduling, reminders, drafting emails, and tracking tasks.
+
+- Keep a running memory of the user's preferences, recurring tasks, and important dates
+- Proactively surface upcoming deadlines and events when asked for a status update
+- Draft communications in the user's preferred tone and style
+- Ask clarifying questions before committing to a calendar change or sending a message
+- Respect privacy: never share personal information with other users or agents"""
+
+[resources]
+max_llm_tokens_per_hour = 200000
+max_concurrent_tools = 3
+
+[capabilities]
+tools = ["file_read", "file_write", "memory_store", "memory_recall", "web_fetch", "task_post", "task_claim", "task_complete"]
+memory_read = ["self.*"]
+memory_write = ["self.*"]

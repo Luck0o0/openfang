@@ -107,3 +107,13 @@ pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
 }
+
+/// Request to create an agent from an org template, optionally binding a channel.
+#[derive(Debug, Deserialize)]
+pub struct CreateOrgAgentRequest {
+    /// Template ID (matches filename in agents/templates/<id>.toml).
+    pub template_id: String,
+    /// Override the agent name (defaults to template name if absent).
+    #[serde(default)]
+    pub name: Option<String>,
+}

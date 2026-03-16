@@ -11267,6 +11267,171 @@ fn remove_toml_section(content: &str, section: &str) -> String {
     result
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+// Organization management API
+// ══════════════════════════════════════════════════════════════════════
+
+/// GET /api/org — List organizations (currently returns a single default org).
+pub async fn list_orgs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let name = state
+        .kernel
+        .config
+        .home_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("My Organization");
+    let org = serde_json::json!({
+        "id": "default",
+        "name": name,
+        "created_at": "2026-01-01T00:00:00Z",
+    });
+    Json(serde_json::json!({ "orgs": [org] }))
+}
+
+/// GET /api/org/templates — List available agent templates from agents/templates/.
+pub async fn list_agent_templates(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let templates_dir = state.kernel.config.home_dir.join("agents").join("templates");
+    let entries = match std::fs::read_dir(&templates_dir) {
+        Ok(e) => e,
+        Err(_) => {
+            return Json(serde_json::json!({ "templates": [] }));
+        }
+    };
+
+    let mut templates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Ok(manifest) =
+            toml::from_str::<openfang_types::agent::AgentManifest>(&content)
+        else {
+            continue;
+        };
+
+        // Extract template_skills from raw TOML (not in AgentManifest schema)
+        let skills: Vec<String> = {
+            let raw: toml::Value = toml::from_str(&content).unwrap_or(toml::Value::Table(Default::default()));
+            raw.get("template_skills")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        templates.push(serde_json::json!({
+            "id": id,
+            "name": manifest.name,
+            "description": manifest.description,
+            "skills": skills,
+            "tags": manifest.tags,
+            "toml_path": path.to_string_lossy(),
+        }));
+    }
+
+    templates.sort_by(|a, b| {
+        a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+    });
+
+    Json(serde_json::json!({ "templates": templates }))
+}
+
+/// POST /api/org/agents — Create an agent from a template.
+pub async fn create_org_agent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateOrgAgentRequest>,
+) -> impl IntoResponse {
+    // Sanitize template_id to prevent path traversal
+    let safe_id: String = req
+        .template_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe_id.is_empty() || safe_id != req.template_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid template_id"})),
+        );
+    }
+
+    let tmpl_path = state
+        .kernel
+        .config
+        .home_dir
+        .join("agents")
+        .join("templates")
+        .join(format!("{safe_id}.toml"));
+
+    let mut content = match std::fs::read_to_string(&tmpl_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Template '{safe_id}' not found")})),
+            );
+        }
+    };
+
+    // Override name if provided
+    if let Some(ref name) = req.name {
+        let safe_name: String = name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if !safe_name.is_empty() {
+            // Replace `name = "..."` line in TOML
+            content = content
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("name =") {
+                        format!("name = \"{}\"", safe_name)
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+
+    let manifest: openfang_types::agent::AgentManifest = match toml::from_str(&content) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid template TOML: {e}")})),
+            );
+        }
+    };
+
+    let agent_name = manifest.name.clone();
+    match state.kernel.spawn_agent(manifest) {
+        Ok(agent_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "agent_id": agent_id.to_string(),
+                "agent_name": agent_name,
+                "template_id": safe_id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod channel_config_tests {
     use super::*;

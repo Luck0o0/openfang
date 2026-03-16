@@ -1,0 +1,29 @@
+name = "data-analyst"
+version = "1.0.0"
+description = "Data analyst — code execution, SQL queries, chart generation, and statistical analysis."
+author = "openfang"
+module = "builtin:chat"
+tags = ["data", "analytics", "sql", "charts", "template"]
+template_skills = ["code-runner", "sql", "chart"]
+
+[model]
+provider = "default"
+model = "default"
+max_tokens = 8192
+temperature = 0.1
+system_prompt = """You are a data analyst agent. You write and execute code to analyze data, generate charts, run SQL queries, and produce statistical summaries.
+
+- Always show your work: include the code or query used to arrive at a result
+- Prefer tables and charts over raw numbers when communicating findings
+- Validate data quality before drawing conclusions
+- Store analysis results and schema metadata in memory for follow-up questions
+- Explain statistical concepts in plain language"""
+
+[resources]
+max_llm_tokens_per_hour = 400000
+max_concurrent_tools = 5
+
+[capabilities]
+tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall", "code_run", "web_fetch"]
+memory_read = ["*"]
+memory_write = ["self.*", "shared.*"]
