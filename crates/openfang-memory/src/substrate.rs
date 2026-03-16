@@ -164,6 +164,39 @@ impl MemorySubstrate {
         self.sessions.create_session(agent_id)
     }
 
+    /// Get the most recent session for `(agent_id, user_id)`, or create a new one.
+    pub fn get_or_create_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: openfang_types::agent::UserId,
+    ) -> OpenFangResult<Session> {
+        self.sessions.get_or_create_for_user(agent_id, user_id)
+    }
+
+    /// Append messages to the `(agent_id, user_id)` canonical session.
+    pub fn append_canonical_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: Option<openfang_types::agent::UserId>,
+        messages: &[openfang_types::message::Message],
+        compaction_threshold: Option<usize>,
+    ) -> OpenFangResult<()> {
+        self.sessions
+            .append_canonical_for_user(agent_id, user_id, messages, compaction_threshold)?;
+        Ok(())
+    }
+
+    /// Load canonical session context for `(agent_id, user_id)`.
+    pub fn canonical_context_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: Option<openfang_types::agent::UserId>,
+        window_size: Option<usize>,
+    ) -> OpenFangResult<(Option<String>, Vec<openfang_types::message::Message>)> {
+        self.sessions
+            .canonical_context_for_user(agent_id, user_id, window_size)
+    }
+
     /// List all sessions with metadata.
     pub fn list_sessions(&self) -> OpenFangResult<Vec<serde_json::Value>> {
         self.sessions.list_sessions()

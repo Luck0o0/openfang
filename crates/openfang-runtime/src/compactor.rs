@@ -731,7 +731,7 @@ mod tests {
             messages: vec![Message::user("hello")],
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig::default();
         assert!(!needs_compaction(&session, &config));
     }
@@ -747,7 +747,7 @@ mod tests {
             messages,
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig::default();
         assert!(needs_compaction(&session, &config));
     }
@@ -796,7 +796,7 @@ mod tests {
             messages: vec![Message::user("hello"), Message::assistant("hi")],
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig {
             threshold: 30,
             keep_recent: 10,
@@ -883,7 +883,7 @@ mod tests {
             messages,
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig {
             threshold: 5,
             keep_recent: 3,
@@ -954,7 +954,7 @@ mod tests {
             messages,
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig {
             threshold: 30,
             keep_recent: 10,
@@ -1081,7 +1081,7 @@ mod tests {
             messages,
             context_window_tokens: 0,
             label: None,
-        };
+            user_id: None,        };
         let config = CompactionConfig {
             threshold: 10,
             keep_recent: 5,

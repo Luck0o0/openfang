@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -323,6 +327,57 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (8, datetime('now'), 'Add audit_entries table for persistent Merkle audit trail');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 9: User-session isolation — add user_id to sessions and rebuild canonical_sessions.
+///
+/// `user_id = ''` (empty string) is the sentinel for "no user context" — identical
+/// to the pre-isolation behaviour.  Per-user callers pass a UUID string.
+///
+/// canonical_sessions is rebuilt because its PK was `agent_id TEXT PRIMARY KEY`.
+/// SQLite cannot alter a PRIMARY KEY in-place, so we create a new table, migrate
+/// existing rows with `user_id = ''`, drop the old table, and rename.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // 1. Add user_id to sessions (NULL-safe: default '' means no isolation)
+    if !column_exists(conn, "sessions", "user_id") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // 2. Fast lookup index for get_or_create_for_user queries
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_agent_user
+         ON sessions(agent_id, user_id, created_at DESC);",
+    )?;
+
+    // 3. Rebuild canonical_sessions with composite PK (agent_id, user_id)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS canonical_sessions_v9 (
+            agent_id          TEXT NOT NULL,
+            user_id           TEXT NOT NULL DEFAULT '',
+            messages          BLOB NOT NULL,
+            compaction_cursor INTEGER NOT NULL DEFAULT 0,
+            compacted_summary TEXT,
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (agent_id, user_id)
+        );
+
+        INSERT OR IGNORE INTO canonical_sessions_v9
+            (agent_id, user_id, messages, compaction_cursor, compacted_summary, updated_at)
+        SELECT agent_id, '', messages, compaction_cursor, compacted_summary, updated_at
+        FROM   canonical_sessions;
+
+        DROP TABLE canonical_sessions;
+
+        ALTER TABLE canonical_sessions_v9 RENAME TO canonical_sessions;
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add user_id for per-user session isolation');
         ",
     )?;
     Ok(())

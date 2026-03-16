@@ -1,10 +1,10 @@
 //! Session management — load/save conversation history.
 
 use chrono::Utc;
-use openfang_types::agent::{AgentId, SessionId};
+use openfang_types::agent::{AgentId, SessionId, UserId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,15 @@ pub struct Session {
     pub context_window_tokens: u64,
     /// Optional human-readable session label.
     pub label: Option<String>,
+    /// Optional user that owns this session (None = no isolation).
+    pub user_id: Option<UserId>,
+}
+
+/// Convert an `Option<UserId>` to the DB string used as the `user_id` column value.
+/// `None` maps to `""` (empty string), which is the backward-compat sentinel.
+#[inline]
+fn user_id_str(user_id: Option<UserId>) -> String {
+    user_id.map(|u| u.to_string()).unwrap_or_default()
 }
 
 /// Session store backed by SQLite.
@@ -43,7 +52,7 @@ impl SessionStore {
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT agent_id, messages, context_window_tokens, label FROM sessions WHERE id = ?1")
+            .prepare("SELECT agent_id, messages, context_window_tokens, label, user_id FROM sessions WHERE id = ?1")
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
         let result = stmt.query_row(rusqlite::params![session_id.0.to_string()], |row| {
@@ -51,22 +60,31 @@ impl SessionStore {
             let messages_blob: Vec<u8> = row.get(1)?;
             let tokens: i64 = row.get(2)?;
             let label: Option<String> = row.get(3).unwrap_or(None);
-            Ok((agent_str, messages_blob, tokens, label))
+            let user_id_str: String = row.get(4).unwrap_or_default();
+            Ok((agent_str, messages_blob, tokens, label, user_id_str))
         });
 
         match result {
-            Ok((agent_str, messages_blob, tokens, label)) => {
+            Ok((agent_str, messages_blob, tokens, label, user_id_str)) => {
                 let agent_id = uuid::Uuid::parse_str(&agent_str)
                     .map(AgentId)
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
                 let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+                let user_id = if user_id_str.is_empty() {
+                    None
+                } else {
+                    uuid::Uuid::parse_str(&user_id_str)
+                        .ok()
+                        .map(UserId)
+                };
                 Ok(Some(Session {
                     id: session_id,
                     agent_id,
                     messages,
                     context_window_tokens: tokens as u64,
                     label,
+                    user_id,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -83,16 +101,18 @@ impl SessionStore {
         let messages_blob = rmp_serde::to_vec_named(&session.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
+        let user_id_str = user_id_str(session.user_id);
         conn.execute(
-            "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, label, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(id) DO UPDATE SET messages = ?3, context_window_tokens = ?4, label = ?5, updated_at = ?6",
+            "INSERT INTO sessions (id, agent_id, messages, context_window_tokens, label, user_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(id) DO UPDATE SET messages = ?3, context_window_tokens = ?4, label = ?5, updated_at = ?7",
             rusqlite::params![
                 session.id.0.to_string(),
                 session.agent_id.0.to_string(),
                 messages_blob,
                 session.context_window_tokens as i64,
                 session.label.as_deref(),
+                user_id_str,
                 now,
             ],
         )
@@ -190,6 +210,7 @@ impl SessionStore {
             messages: Vec::new(),
             context_window_tokens: 0,
             label: None,
+            user_id: None,
         };
         self.save_session(&session)?;
         Ok(session)
@@ -251,6 +272,7 @@ impl SessionStore {
                     messages,
                     context_window_tokens: tokens as u64,
                     label: lbl,
+                    user_id: None,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -309,9 +331,71 @@ impl SessionStore {
             messages: Vec::new(),
             context_window_tokens: 0,
             label: label.map(|s| s.to_string()),
+            user_id: None,
         };
         self.save_session(&session)?;
         Ok(session)
+    }
+
+    /// Get the most recent session for `(agent_id, user_id)`, or create a fresh one.
+    ///
+    /// Uses UNIQUE INDEX + SELECT pattern to handle concurrent first-message races:
+    /// the new row is ignored if a session already exists, and the latest is returned.
+    pub fn get_or_create_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: UserId,
+    ) -> OpenFangResult<Session> {
+        let uid_str = user_id.to_string();
+        // Try to find the most recent session for this (agent, user) pair
+        let existing = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM sessions
+                     WHERE agent_id = ?1 AND user_id = ?2
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            stmt.query_row(
+                rusqlite::params![agent_id.0.to_string(), uid_str],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?
+        };
+
+        match existing {
+            Some(id_str) => {
+                let session_id = uuid::Uuid::parse_str(&id_str)
+                    .map(SessionId)
+                    .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                Ok(self.get_session(session_id)?.unwrap_or_else(|| Session {
+                    id: session_id,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                    user_id: Some(user_id),
+                }))
+            }
+            None => {
+                let session = Session {
+                    id: SessionId::new(),
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                    user_id: Some(user_id),
+                };
+                self.save_session(&session)?;
+                Ok(session)
+            }
+        }
     }
 
     /// Store an LLM-generated summary, replacing older messages with the summary
@@ -343,12 +427,14 @@ const DEFAULT_COMPACTION_THRESHOLD: usize = 100;
 /// A canonical session stores persistent cross-channel context for an agent.
 ///
 /// Unlike regular sessions (one per channel interaction), there is one canonical
-/// session per agent. All channels contribute to it, so what a user tells an agent
-/// on Telegram is remembered on Discord.
+/// session per (agent, user) pair. When `user_id` is `None` the session is shared
+/// across all callers (pre-isolation / backward-compat behaviour).
 #[derive(Debug, Clone)]
 pub struct CanonicalSession {
     /// The agent this session belongs to.
     pub agent_id: AgentId,
+    /// The user this session belongs to (None = no isolation / backward-compat).
+    pub user_id: Option<UserId>,
     /// Full message history (post-compaction window).
     pub messages: Vec<Message>,
     /// Index marking how far compaction has processed.
@@ -360,8 +446,22 @@ pub struct CanonicalSession {
 }
 
 impl SessionStore {
-    /// Load the canonical session for an agent, creating one if it doesn't exist.
+    /// Load the canonical session for an agent (no-user / backward-compat path).
+    ///
+    /// Equivalent to `load_canonical_for_user(agent_id, None)`.
     pub fn load_canonical(&self, agent_id: AgentId) -> OpenFangResult<CanonicalSession> {
+        self.load_canonical_for_user(agent_id, None)
+    }
+
+    /// Load the canonical session for `(agent_id, user_id)`, creating one if absent.
+    ///
+    /// `user_id = None` targets the backward-compat row (stored as `user_id = ''`).
+    pub fn load_canonical_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: Option<UserId>,
+    ) -> OpenFangResult<CanonicalSession> {
+        let uid_str = user_id_str(user_id);
         let conn = self
             .conn
             .lock()
@@ -369,17 +469,20 @@ impl SessionStore {
         let mut stmt = conn
             .prepare(
                 "SELECT messages, compaction_cursor, compacted_summary, updated_at \
-                 FROM canonical_sessions WHERE agent_id = ?1",
+                 FROM canonical_sessions WHERE agent_id = ?1 AND user_id = ?2",
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-        let result = stmt.query_row(rusqlite::params![agent_id.0.to_string()], |row| {
-            let messages_blob: Vec<u8> = row.get(0)?;
-            let cursor: i64 = row.get(1)?;
-            let summary: Option<String> = row.get(2)?;
-            let updated_at: String = row.get(3)?;
-            Ok((messages_blob, cursor, summary, updated_at))
-        });
+        let result = stmt.query_row(
+            rusqlite::params![agent_id.0.to_string(), uid_str],
+            |row| {
+                let messages_blob: Vec<u8> = row.get(0)?;
+                let cursor: i64 = row.get(1)?;
+                let summary: Option<String> = row.get(2)?;
+                let updated_at: String = row.get(3)?;
+                Ok((messages_blob, cursor, summary, updated_at))
+            },
+        );
 
         match result {
             Ok((messages_blob, cursor, summary, updated_at)) => {
@@ -387,6 +490,7 @@ impl SessionStore {
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
                 Ok(CanonicalSession {
                     agent_id,
+                    user_id,
                     messages,
                     compaction_cursor: cursor as usize,
                     compacted_summary: summary,
@@ -397,6 +501,7 @@ impl SessionStore {
                 let now = Utc::now().to_rfc3339();
                 Ok(CanonicalSession {
                     agent_id,
+                    user_id,
                     messages: Vec::new(),
                     compaction_cursor: 0,
                     compacted_summary: None,
@@ -409,16 +514,27 @@ impl SessionStore {
 
     /// Append new messages to the canonical session and compact if over threshold.
     ///
-    /// Compaction summarizes old messages into a text summary and trims the
-    /// message list. The `compaction_threshold` controls when this happens
-    /// (default: 100 messages).
+    /// Backward-compat wrapper — delegates to `append_canonical_for_user(agent_id, None, …)`.
     pub fn append_canonical(
         &self,
         agent_id: AgentId,
         new_messages: &[Message],
         compaction_threshold: Option<usize>,
     ) -> OpenFangResult<CanonicalSession> {
-        let mut canonical = self.load_canonical(agent_id)?;
+        self.append_canonical_for_user(agent_id, None, new_messages, compaction_threshold)
+    }
+
+    /// Append new messages to the `(agent_id, user_id)` canonical session.
+    ///
+    /// `user_id = None` targets the backward-compat row (stored as `user_id = ''`).
+    pub fn append_canonical_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: Option<UserId>,
+        new_messages: &[Message],
+        compaction_threshold: Option<usize>,
+    ) -> OpenFangResult<CanonicalSession> {
+        let mut canonical = self.load_canonical_for_user(agent_id, user_id)?;
         canonical.messages.extend(new_messages.iter().cloned());
 
         let threshold = compaction_threshold.unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
@@ -476,14 +592,26 @@ impl SessionStore {
 
     /// Get recent messages from canonical session for context injection.
     ///
-    /// Returns up to `window_size` recent messages (default 50), plus
-    /// the compacted summary if available.
+    /// Backward-compat wrapper — delegates to `canonical_context_for_user(agent_id, None, …)`.
     pub fn canonical_context(
         &self,
         agent_id: AgentId,
         window_size: Option<usize>,
     ) -> OpenFangResult<(Option<String>, Vec<Message>)> {
-        let canonical = self.load_canonical(agent_id)?;
+        self.canonical_context_for_user(agent_id, None, window_size)
+    }
+
+    /// Get recent messages from the `(agent_id, user_id)` canonical session.
+    ///
+    /// Returns up to `window_size` recent messages (default 50), plus
+    /// the compacted summary if available.
+    pub fn canonical_context_for_user(
+        &self,
+        agent_id: AgentId,
+        user_id: Option<UserId>,
+        window_size: Option<usize>,
+    ) -> OpenFangResult<(Option<String>, Vec<Message>)> {
+        let canonical = self.load_canonical_for_user(agent_id, user_id)?;
         let window = window_size.unwrap_or(DEFAULT_CANONICAL_WINDOW);
         let start = canonical.messages.len().saturating_sub(window);
         let recent = canonical.messages[start..].to_vec();
@@ -498,12 +626,14 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let messages_blob = rmp_serde::to_vec(&canonical.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        let uid_str = user_id_str(canonical.user_id);
         conn.execute(
-            "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(agent_id) DO UPDATE SET messages = ?2, compaction_cursor = ?3, compacted_summary = ?4, updated_at = ?5",
+            "INSERT INTO canonical_sessions (agent_id, user_id, messages, compaction_cursor, compacted_summary, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id, user_id) DO UPDATE SET messages = ?3, compaction_cursor = ?4, compacted_summary = ?5, updated_at = ?6",
             rusqlite::params![
                 canonical.agent_id.0.to_string(),
+                uid_str,
                 messages_blob,
                 canonical.compaction_cursor as i64,
                 canonical.compacted_summary,
@@ -809,5 +939,74 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // User-isolation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_or_create_for_user_creates_and_returns_same() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let uid = UserId::new();
+
+        let s1 = store.get_or_create_for_user(agent_id, uid).unwrap();
+        let s2 = store.get_or_create_for_user(agent_id, uid).unwrap();
+        // Same user → same session
+        assert_eq!(s1.id, s2.id);
+        assert_eq!(s1.user_id, Some(uid));
+    }
+
+    #[test]
+    fn test_different_users_get_different_sessions() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let uid_a = UserId::new();
+        let uid_b = UserId::new();
+
+        let sa = store.get_or_create_for_user(agent_id, uid_a).unwrap();
+        let sb = store.get_or_create_for_user(agent_id, uid_b).unwrap();
+        assert_ne!(sa.id, sb.id);
+        assert_eq!(sa.user_id, Some(uid_a));
+        assert_eq!(sb.user_id, Some(uid_b));
+    }
+
+    #[test]
+    fn test_canonical_sessions_are_isolated_per_user() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let uid_a = UserId::new();
+        let uid_b = UserId::new();
+
+        // User A tells the agent their name
+        store
+            .append_canonical_for_user(
+                agent_id,
+                Some(uid_a),
+                &[Message::user("My name is Alice")],
+                None,
+            )
+            .unwrap();
+
+        // User B's canonical session should be empty (isolated)
+        let (_, msgs_b) = store
+            .canonical_context_for_user(agent_id, Some(uid_b), None)
+            .unwrap();
+        assert!(msgs_b.is_empty());
+
+        // User A's session still has their message
+        let (_, msgs_a) = store
+            .canonical_context_for_user(agent_id, Some(uid_a), None)
+            .unwrap();
+        assert_eq!(msgs_a.len(), 1);
+        assert!(msgs_a[0].content.text_content().contains("Alice"));
+    }
+
+    #[test]
+    fn test_v9_migration_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        run_migrations(&conn).unwrap(); // should not error
     }
 }

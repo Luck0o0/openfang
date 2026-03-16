@@ -1677,6 +1677,7 @@ impl OpenFangKernel {
                 messages: Vec::new(),
                 context_window_tokens: 0,
                 label: None,
+                user_id: None,
             });
 
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
@@ -2222,6 +2223,7 @@ impl OpenFangKernel {
                 messages: Vec::new(),
                 context_window_tokens: 0,
                 label: None,
+                user_id: None,
             });
 
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
@@ -3048,6 +3050,7 @@ impl OpenFangKernel {
                 messages: Vec::new(),
                 context_window_tokens: 0,
                 label: None,
+                user_id: None,
             });
 
         let config = CompactionConfig::default();
@@ -3130,6 +3133,7 @@ impl OpenFangKernel {
                 messages: Vec::new(),
                 context_window_tokens: 0,
                 label: None,
+                user_id: None,
             });
 
         let system_prompt = &entry.manifest.model.system_prompt;
