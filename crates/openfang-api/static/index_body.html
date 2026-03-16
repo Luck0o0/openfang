@@ -160,6 +160,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2 2 2 0 0 0-2 2v6"/><path d="M10 10.5V6a2 2 0 0 0-2-2 2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.9-5.7-2.4L3.4 16a2 2 0 0 1 3.2-2.4L8 15"/></svg></span>
               <span class="nav-label">Hands</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'org' }" @click="navigate('org')" :aria-current="page === 'org' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+              <span class="nav-label">Org</span>
+            </a>
           </div>
         </template>
       </div>
@@ -3171,6 +3175,73 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <span x-text="activateResult"></span>
             </div>
           </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- Page: Org Management -->
+    <template x-if="page === 'org'">
+      <div x-data="orgPage" x-init="loadData()">
+        <div class="page-header">
+          <h2>Organization</h2>
+        </div>
+        <div class="page-body">
+          <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading templates...</span></div>
+          <div x-show="!loading && loadError" class="error-state" x-text="loadError"></div>
+
+          <template x-if="!loading && !loadError">
+            <div>
+              <!-- Template gallery -->
+              <div class="section-header" style="margin-bottom:12px">
+                <h3 style="margin:0">Agent Templates</h3>
+                <p style="margin:4px 0 0;color:var(--text-muted);font-size:.85rem">Start from a pre-configured template</p>
+              </div>
+              <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:28px">
+                <template x-for="tpl in templates" :key="tpl.id">
+                  <div class="card" style="padding:16px;cursor:pointer" @click="openCreateModal(tpl)">
+                    <div style="font-weight:600;margin-bottom:4px" x-text="tpl.name"></div>
+                    <div style="font-size:.83rem;color:var(--text-muted);margin-bottom:10px" x-text="tpl.description"></div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                      <template x-for="tag in tpl.tags" :key="tag">
+                        <span class="badge" x-text="tag"></span>
+                      </template>
+                    </div>
+                    <button class="btn btn-primary btn-sm" style="margin-top:12px;width:100%" @click.stop="openCreateModal(tpl)">Create Agent</button>
+                  </div>
+                </template>
+                <div x-show="templates.length === 0" class="empty-state">No templates found in agents/templates/</div>
+              </div>
+            </div>
+          </template>
+
+          <!-- Create modal -->
+          <template x-if="showCreateModal">
+            <div class="modal-overlay" @click.self="showCreateModal=false">
+              <div class="modal" style="max-width:440px">
+                <div class="modal-header">
+                  <h3>Create Agent from Template</h3>
+                  <button class="btn-icon" @click="showCreateModal=false"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+                </div>
+                <div class="modal-body">
+                  <div class="form-group">
+                    <label>Template</label>
+                    <div x-text="selectedTemplate && selectedTemplate.name" style="font-weight:600"></div>
+                  </div>
+                  <div class="form-group">
+                    <label for="org-agent-name">Agent Name</label>
+                    <input id="org-agent-name" class="form-input" type="text" x-model="createForm.name" placeholder="Leave blank to use template name">
+                  </div>
+                  <div x-show="createError" class="error-state" x-text="createError" style="margin-top:8px"></div>
+                </div>
+                <div class="modal-footer">
+                  <button class="btn btn-secondary btn-sm" @click="showCreateModal=false">Cancel</button>
+                  <button class="btn btn-primary btn-sm" @click="createAgent()" :disabled="creating">
+                    <span x-text="creating ? 'Creating...' : 'Create'"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
     </template>
