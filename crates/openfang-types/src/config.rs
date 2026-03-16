@@ -2401,6 +2401,14 @@ pub struct FeishuConfig {
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+    /// Connection mode: "websocket" (long-connection, no public IP required) or
+    /// "webhook" (legacy HTTP push, requires public IP).
+    #[serde(default = "feishu_default_connection_mode")]
+    pub connection_mode: String,
+}
+
+fn feishu_default_connection_mode() -> String {
+    "websocket".to_string()
 }
 
 impl Default for FeishuConfig {
@@ -2416,6 +2424,7 @@ impl Default for FeishuConfig {
             bot_names: Vec::new(),
             default_agent: None,
             overrides: ChannelOverrides::default(),
+            connection_mode: feishu_default_connection_mode(),
         }
     }
 }

@@ -25,6 +25,7 @@ pub mod zulip;
 // Wave 3 — High-value channels
 pub mod bluesky;
 pub mod feishu;
+pub mod feishu_proto;
 pub mod line;
 pub mod mastodon;
 pub mod messenger;
