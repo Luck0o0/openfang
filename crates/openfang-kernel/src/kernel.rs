@@ -1442,6 +1442,56 @@ impl OpenFangKernel {
             .await
     }
 
+    /// Send a message on behalf of a specific user.  The agent will use a
+    /// per-`(agent_id, user_id)` session and a user-scoped sandbox directory.
+    pub async fn send_message_as(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        user_context: Option<UserContext>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            None,
+            None,
+            None,
+            user_context,
+        )
+        .await
+    }
+
+    /// Send a multimodal message with user context (text + images).
+    pub async fn send_message_with_blocks_as(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        user_context: Option<UserContext>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            Some(blocks),
+            None,
+            None,
+            user_context,
+        )
+        .await
+    }
+
     /// Send a multimodal message (text + images) to an agent and get a response.
     ///
     /// Used by channel bridges when a user sends a photo — the image is downloaded,
@@ -1464,6 +1514,7 @@ impl OpenFangKernel {
             Some(blocks),
             None,
             None,
+            None,
         )
         .await
     }
@@ -1484,6 +1535,7 @@ impl OpenFangKernel {
             None,
             sender_id,
             sender_name,
+            None,
         )
         .await
     }
@@ -1497,6 +1549,7 @@ impl OpenFangKernel {
     /// Per-agent locking ensures that concurrent messages for the same agent
     /// are serialized (preventing session corruption), while messages for
     /// different agents run in parallel.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_with_handle_and_blocks(
         &self,
         agent_id: AgentId,
@@ -1505,6 +1558,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        user_context: Option<UserContext>,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -1542,6 +1596,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                user_context,
             )
             .await
         };
@@ -2207,24 +2262,31 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        user_context: Option<UserContext>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-                user_id: None,
-            });
+        let mut session = if let Some(ref ctx) = user_context {
+            // User-isolated path: get-or-create a per-(agent, user) session
+            self.memory
+                .get_or_create_for_user(agent_id, ctx.user_id)
+                .map_err(KernelError::OpenFang)?
+        } else {
+            self.memory
+                .get_session(entry.session_id)
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: entry.session_id,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                    user_id: None,
+                })
+        };
 
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
         {
@@ -2278,17 +2340,33 @@ impl OpenFangKernel {
         // Apply model routing if configured (disabled in Stable mode)
         let mut manifest = entry.manifest.clone();
 
-        // Lazy backfill: create workspace for existing agents spawned before workspaces
-        if manifest.workspace.is_none() {
-            let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
-            if let Err(e) = ensure_workspace(&workspace_dir) {
-                warn!(agent_id = %agent_id, "Failed to backfill workspace: {e}");
+        // Workspace setup — with user isolation, each user gets their own subdirectory.
+        if let Some(ref ctx) = user_context {
+            // Per-user workspace: workspaces/<agent_name>/users/<user_id>/
+            let user_workspace = self
+                .config
+                .effective_workspaces_dir()
+                .join(&manifest.name)
+                .join("users")
+                .join(ctx.user_id.to_string());
+            if let Err(e) = ensure_workspace(&user_workspace) {
+                warn!(agent_id = %agent_id, user_id = %ctx.user_id, "Failed to create user workspace: {e}");
             } else {
-                manifest.workspace = Some(workspace_dir);
-                // Persist updated workspace in registry
-                let _ = self
-                    .registry
-                    .update_workspace(agent_id, manifest.workspace.clone());
+                manifest.workspace = Some(user_workspace);
+            }
+        } else {
+            // Legacy backfill: create workspace for existing agents spawned before workspaces
+            if manifest.workspace.is_none() {
+                let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
+                if let Err(e) = ensure_workspace(&workspace_dir) {
+                    warn!(agent_id = %agent_id, "Failed to backfill workspace: {e}");
+                } else {
+                    manifest.workspace = Some(workspace_dir);
+                    // Persist updated workspace in registry
+                    let _ = self
+                        .registry
+                        .update_workspace(agent_id, manifest.workspace.clone());
+                }
             }
         }
 
@@ -2344,7 +2422,11 @@ impl OpenFangKernel {
                     .and_then(|w| read_identity_file(w, "MEMORY.md")),
                 canonical_context: self
                     .memory
-                    .canonical_context(agent_id, None)
+                    .canonical_context_for_user(
+                        agent_id,
+                        user_context.as_ref().map(|c| c.user_id),
+                        None,
+                    )
                     .ok()
                     .and_then(|(s, _)| s),
                 user_name,
@@ -2519,7 +2601,12 @@ impl OpenFangKernel {
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
             let new_messages = session.messages[messages_before..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
+            if let Err(e) = self.memory.append_canonical_for_user(
+                agent_id,
+                user_context.as_ref().map(|c| c.user_id),
+                &new_messages,
+                None,
+            ) {
                 warn!("Failed to update canonical session: {e}");
             }
         }

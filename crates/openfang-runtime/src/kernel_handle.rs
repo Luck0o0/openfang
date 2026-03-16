@@ -37,6 +37,20 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// Send a message to another agent on behalf of a user.
+    ///
+    /// Default implementation falls back to `send_to_agent` (no isolation),
+    /// preserving backward-compatibility.  The kernel overrides this to route
+    /// the call through `send_message_as`.
+    async fn send_to_agent_as(
+        &self,
+        agent_id: &str,
+        message: &str,
+        _user_context: Option<openfang_types::agent::UserContext>,
+    ) -> Result<String, String> {
+        self.send_to_agent(agent_id, message).await
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 
