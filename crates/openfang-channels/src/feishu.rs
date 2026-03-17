@@ -1194,8 +1194,16 @@ async fn handle_ws_frame(
                 .map(|h| h.value.clone())
                 .unwrap_or_default();
 
+            info!(
+                "Feishu WS: data frame seq={} type={} msg_id={}",
+                frame.seq_id,
+                msg_type,
+                if message_id.is_empty() { "(none)" } else { &message_id }
+            );
+
             // Deduplicate by message_id header
             if !message_id.is_empty() && message_dedup.check_and_insert(&message_id) {
+                info!("Feishu WS: duplicate message_id={message_id}, skipped");
                 return;
             }
 
@@ -1219,17 +1227,22 @@ async fn handle_ws_frame(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !event_id.is_empty() && event_dedup.check_and_insert(event_id) {
+                    info!("Feishu WS: duplicate event_id={event_id}, skipped");
                     return;
                 }
 
                 if let Some(msg) = parse_event(&event, bot_names, channel_name) {
+                    info!("Feishu WS: dispatching event to agent bridge");
                     if tx.send(msg).await.is_err() {
                         error!("Feishu WS: channel receiver dropped");
                     }
+                } else {
+                    info!("Feishu WS: event ignored (not a user message for this bot)");
                 }
             }
 
             // ACK every data frame
+            info!("Feishu WS: sending ACK for seq={}", frame.seq_id);
             let ack = build_ack(frame.seq_id, &message_id);
             let _ = write_tx.send(WsMessage::Binary(ack)).await;
         }
