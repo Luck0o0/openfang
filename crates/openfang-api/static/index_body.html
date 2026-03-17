@@ -1392,7 +1392,10 @@
                       <div class="flex gap-2 items-center">
                         <span class="text-xs text-dim font-bold" x-text="'#' + (i+1)" style="width:24px"></span>
                         <input class="form-input" style="flex:1" x-model="step.name" placeholder="Step name">
-                        <input class="form-input" style="flex:1" x-model="step.agent_name" placeholder="Agent name">
+                        <select class="form-select" style="flex:1" x-model="step.agent_name">
+                          <option value="">Select agent…</option>
+                          <template x-for="a in agents" :key="a.id"><option :value="a.name" x-text="a.name"></option></template>
+                        </select>
                         <select class="form-select" style="width:120px" x-model="step.mode">
                           <option value="sequential">Sequential</option>
                           <option value="fan_out">Fan Out</option>
@@ -1441,7 +1444,10 @@
                       <div class="flex gap-2 items-center">
                         <span class="text-xs text-dim font-bold" x-text="'#' + (i+1)" style="width:24px"></span>
                         <input class="form-input" style="flex:1" x-model="step.name" placeholder="Step name">
-                        <input class="form-input" style="flex:1" x-model="step.agent_name" placeholder="Agent name">
+                        <select class="form-select" style="flex:1" x-model="step.agent_name">
+                          <option value="">Select agent…</option>
+                          <template x-for="a in agents" :key="a.id"><option :value="a.name" x-text="a.name"></option></template>
+                        </select>
                         <select class="form-select" style="width:120px" x-model="step.mode">
                           <option value="sequential">Sequential</option>
                           <option value="fan_out">Fan Out</option>

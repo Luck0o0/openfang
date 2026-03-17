@@ -5,6 +5,7 @@ function workflowsPage() {
   return {
     // -- Workflows state --
     workflows: [],
+    agents: [],
     showCreateModal: false,
     runModal: null,
     runInput: '',
@@ -21,7 +22,10 @@ function workflowsPage() {
       this.loading = true;
       this.loadError = '';
       try {
-        this.workflows = await OpenFangAPI.get('/api/workflows');
+        [this.workflows, this.agents] = await Promise.all([
+          OpenFangAPI.get('/api/workflows'),
+          OpenFangAPI.get('/api/agents').catch(function() { return []; }),
+        ]);
       } catch(e) {
         this.workflows = [];
         this.loadError = e.message || 'Could not load workflows.';
