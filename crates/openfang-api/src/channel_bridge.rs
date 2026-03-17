@@ -1482,6 +1482,7 @@ pub async fn start_channel_bridge_with_config(
                 fs_config.verification_token.clone(),
                 encrypt_key,
                 fs_config.bot_names.clone(),
+                fs_config.connection_mode.clone(),
             ));
             adapters.push((adapter, fs_config.default_agent.clone()));
         }

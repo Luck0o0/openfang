@@ -11,19 +11,23 @@
 //! - Rich text (post) message parsing
 //! - Event encryption/decryption support (AES-256-CBC)
 //! - Tenant access token caching with auto-refresh
+//! - WebSocket long-connection mode (no public IP required)
 
+use crate::feishu_proto;
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::Stream;
+use futures::{SinkExt, Stream, StreamExt};
+use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{info, warn};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 // ─── Region-based API endpoints ─────────────────────────────────────────────
@@ -148,6 +152,8 @@ pub struct FeishuAdapter {
     message_dedup: Arc<DedupCache>,
     /// Event deduplication cache.
     event_dedup: Arc<DedupCache>,
+    /// Connection mode: "websocket" or "webhook".
+    connection_mode: String,
 }
 
 impl FeishuAdapter {
@@ -169,6 +175,7 @@ impl FeishuAdapter {
             cached_token: Arc::new(RwLock::new(None)),
             message_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
             event_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
+            connection_mode: "websocket".to_string(),
         }
     }
 
@@ -183,6 +190,7 @@ impl FeishuAdapter {
         verification_token: Option<String>,
         encrypt_key: Option<String>,
         bot_names: Vec<String>,
+        connection_mode: String,
     ) -> Self {
         let mut adapter = Self::new(app_id, app_secret, webhook_port);
         adapter.region = region;
@@ -192,6 +200,7 @@ impl FeishuAdapter {
         adapter.verification_token = verification_token;
         adapter.encrypt_key = encrypt_key;
         adapter.bot_names = bot_names;
+        adapter.connection_mode = connection_mode;
         adapter
     }
 
@@ -634,18 +643,43 @@ impl ChannelAdapter for FeishuAdapter {
         info!("{label} adapter authenticated as {bot_name}");
 
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
-        let port = self.webhook_port;
-        let webhook_path = self.webhook_path.clone();
-        let verification_token = self.verification_token.clone();
-        let encrypt_key = self.encrypt_key.clone();
-        let bot_names = self.bot_names.clone();
-        let channel_name = self.region.channel_name().to_string();
-        let region_label = self.region.label().to_string();
         let message_dedup = Arc::clone(&self.message_dedup);
         let event_dedup = Arc::clone(&self.event_dedup);
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        tokio::spawn(async move {
+        if self.connection_mode == "websocket" {
+            // ── Long-connection (WebSocket) mode ──
+            let app_id = self.app_id.clone();
+            let app_secret = self.app_secret.as_str().to_string();
+            let domain = self.region.domain().to_string();
+            let channel_name = self.region.channel_name().to_string();
+            let bot_names = self.bot_names.clone();
+
+            tokio::spawn(async move {
+                start_websocket_loop(WsLoopArgs {
+                    app_id,
+                    app_secret,
+                    domain,
+                    channel_name,
+                    bot_names,
+                    tx,
+                    message_dedup,
+                    event_dedup,
+                    shutdown_rx,
+                })
+                .await;
+            });
+        } else {
+            // ── Webhook (HTTP push) mode ──
+            let port = self.webhook_port;
+            let webhook_path = self.webhook_path.clone();
+            let verification_token = self.verification_token.clone();
+            let encrypt_key = self.encrypt_key.clone();
+            let bot_names = self.bot_names.clone();
+            let channel_name = self.region.channel_name().to_string();
+            let region_label = self.region.label().to_string();
+
+            tokio::spawn(async move {
             let verification_token = Arc::new(verification_token);
             let encrypt_key = Arc::new(encrypt_key);
             let tx = Arc::new(tx);
@@ -853,7 +887,8 @@ impl ChannelAdapter for FeishuAdapter {
                     info!("{} adapter shutting down", *region_label);
                 }
             }
-        });
+            }); // end tokio::spawn for webhook mode
+        } // end else (webhook mode)
 
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -886,6 +921,400 @@ impl ChannelAdapter for FeishuAdapter {
     }
 }
 
+// ─── WebSocket long-connection implementation ────────────────────────────────
+
+/// Feishu WSS endpoint response.
+#[derive(serde::Deserialize)]
+struct WssEndpointResp {
+    code: i32,
+    data: Option<WssEndpointData>,
+    #[allow(dead_code)]
+    msg: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WssEndpointData {
+    #[serde(rename = "URL")]
+    url: String,
+    #[serde(rename = "ClientConfig")]
+    client_config: WssClientConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct WssClientConfig {
+    #[serde(rename = "PingInterval")]
+    ping_interval: u64,
+}
+
+/// Outer reconnect loop for WebSocket long-connection mode.
+///
+/// Modeled directly on `dingtalk_stream.rs`, with the key difference that
+/// Feishu uses Protobuf binary frames instead of JSON text frames.
+/// Arguments for `start_websocket_loop`, grouped to avoid clippy's too-many-arguments lint.
+struct WsLoopArgs {
+    app_id: String,
+    app_secret: String,
+    domain: String,
+    channel_name: String,
+    bot_names: Vec<String>,
+    tx: mpsc::Sender<ChannelMessage>,
+    message_dedup: Arc<DedupCache>,
+    event_dedup: Arc<DedupCache>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+async fn start_websocket_loop(args: WsLoopArgs) {
+    let WsLoopArgs {
+        app_id,
+        app_secret,
+        domain,
+        channel_name,
+        bot_names,
+        tx,
+        message_dedup,
+        event_dedup,
+        mut shutdown_rx,
+    } = args;
+    let http = reqwest::Client::new();
+    let bot_names = Arc::new(bot_names);
+    let mut attempt: u32 = 0;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Feishu WS: shutdown requested");
+            break;
+        }
+
+        // ── Step 1: Fetch WSS endpoint URL ───────────────────────────
+        let endpoint_url = format!("{domain}/callback/ws/endpoint");
+        let resp = match http
+            .post(&endpoint_url)
+            .json(&serde_json::json!({"AppID": app_id, "AppSecret": app_secret}))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Feishu WS: endpoint request failed: {e}");
+                attempt += 1;
+                tokio::time::sleep(ws_backoff(attempt)).await;
+                continue;
+            }
+        };
+
+        let wss_resp: WssEndpointResp = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Feishu WS: endpoint response parse failed: {e}");
+                attempt += 1;
+                tokio::time::sleep(ws_backoff(attempt)).await;
+                continue;
+            }
+        };
+
+        if wss_resp.code != 0 {
+            // 401/403 → auth failure, do NOT retry
+            error!(
+                "Feishu WS: endpoint returned code={} — check AppID/AppSecret, stopping",
+                wss_resp.code
+            );
+            break;
+        }
+
+        let data = match wss_resp.data {
+            Some(d) => d,
+            None => {
+                warn!("Feishu WS: endpoint response missing data");
+                attempt += 1;
+                tokio::time::sleep(ws_backoff(attempt)).await;
+                continue;
+            }
+        };
+
+        let wss_url = data.url;
+        let ping_interval = Duration::from_secs(data.client_config.ping_interval.max(30));
+
+        info!(
+            "Feishu WS: connecting to {}…",
+            &wss_url[..wss_url.len().min(60)]
+        );
+
+        // ── Step 2: Connect WebSocket ─────────────────────────────────
+        let ws_stream = match connect_async(&wss_url).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                warn!("Feishu WS: connect failed: {e}");
+                attempt += 1;
+                tokio::time::sleep(ws_backoff(attempt)).await;
+                continue;
+            }
+        };
+
+        info!("Feishu WS: connected");
+        attempt = 0;
+
+        let (sink, mut source) = ws_stream.split();
+
+        // ── Step 3: Writer task — sole owner of sink, zero-lock writes ─
+        let (write_tx, write_rx) = mpsc::channel::<WsMessage>(64);
+        let writer_handle = tokio::spawn(async move {
+            ws_writer_task(sink, write_rx).await;
+        });
+
+        // ── Step 4: Heartbeat task ────────────────────────────────────
+        let hb_write_tx = write_tx.clone();
+        let hb_handle = tokio::spawn(async move {
+            ws_heartbeat_task(hb_write_tx, ping_interval).await;
+        });
+
+        // ── Step 5: Message loop ──────────────────────────────────────
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Feishu WS: graceful shutdown");
+                        hb_handle.abort();
+                        writer_handle.abort();
+                        return;
+                    }
+                }
+                msg = source.next() => {
+                    match msg {
+                        None => {
+                            warn!("Feishu WS: connection closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            warn!("Feishu WS: stream error: {e}");
+                            break;
+                        }
+                        Some(Ok(WsMessage::Binary(bytes))) => {
+                            handle_ws_frame(
+                                &bytes,
+                                &write_tx,
+                                &tx,
+                                &channel_name,
+                                &bot_names,
+                                &message_dedup,
+                                &event_dedup,
+                            )
+                            .await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) => {
+                            info!("Feishu WS: received close frame");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Abort helper tasks before reconnecting to prevent leaks
+        hb_handle.abort();
+        writer_handle.abort();
+
+        attempt += 1;
+        let delay = ws_backoff(attempt);
+        info!("Feishu WS: reconnecting in {delay:?} (attempt {attempt})");
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Writer task — holds exclusive ownership of the WebSocket sink.
+/// All writes (heartbeat pings, ACKs) go through this task via mpsc,
+/// eliminating any mutex contention.
+async fn ws_writer_task(
+    mut sink: futures::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        WsMessage,
+    >,
+    mut rx: mpsc::Receiver<WsMessage>,
+) {
+    while let Some(msg) = rx.recv().await {
+        if sink.send(msg).await.is_err() {
+            break;
+        }
+    }
+    let _ = sink.close().await;
+}
+
+/// Heartbeat task — sends a Feishu ping frame every `interval`.
+async fn ws_heartbeat_task(write_tx: mpsc::Sender<WsMessage>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // skip the immediate first tick
+    loop {
+        ticker.tick().await;
+        let ping = build_ping();
+        if write_tx.send(WsMessage::Binary(ping)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Dispatch a single binary WebSocket frame.
+async fn handle_ws_frame(
+    bytes: &[u8],
+    write_tx: &mpsc::Sender<WsMessage>,
+    tx: &mpsc::Sender<ChannelMessage>,
+    channel_name: &str,
+    bot_names: &[String],
+    message_dedup: &Arc<DedupCache>,
+    event_dedup: &Arc<DedupCache>,
+) {
+    let frame = match decode_frame(bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Feishu WS: protobuf decode error: {e}");
+            return;
+        }
+    };
+
+    let msg_type = frame
+        .headers
+        .iter()
+        .find(|h| h.key == "type")
+        .map(|h| h.value.as_str())
+        .unwrap_or("");
+
+    match frame.method {
+        0 => {
+            // Control frame — reply with pong
+            let pong = build_pong(frame.seq_id);
+            let _ = write_tx.send(WsMessage::Binary(pong)).await;
+        }
+        1 => {
+            // Data frame — parse event payload
+            let message_id = frame
+                .headers
+                .iter()
+                .find(|h| h.key == "message_id")
+                .map(|h| h.value.clone())
+                .unwrap_or_default();
+
+            info!(
+                "Feishu WS: data frame seq={} type={} msg_id={}",
+                frame.seq_id,
+                msg_type,
+                if message_id.is_empty() { "(none)" } else { &message_id }
+            );
+
+            // Deduplicate by message_id header
+            if !message_id.is_empty() && message_dedup.check_and_insert(&message_id) {
+                info!("Feishu WS: duplicate message_id={message_id}, skipped");
+                return;
+            }
+
+            if msg_type == "event" || msg_type.is_empty() {
+                let payload_str = match std::str::from_utf8(&frame.payload) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let event: serde_json::Value = match serde_json::from_str(payload_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Feishu WS: event JSON parse error: {e}");
+                        return;
+                    }
+                };
+
+                // Deduplicate by event_id from the event envelope
+                let event_id = event
+                    .get("header")
+                    .and_then(|h| h.get("event_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !event_id.is_empty() && event_dedup.check_and_insert(event_id) {
+                    info!("Feishu WS: duplicate event_id={event_id}, skipped");
+                    return;
+                }
+
+                if let Some(msg) = parse_event(&event, bot_names, channel_name) {
+                    info!("Feishu WS: dispatching event to agent bridge");
+                    if tx.send(msg).await.is_err() {
+                        error!("Feishu WS: channel receiver dropped");
+                    }
+                } else {
+                    info!("Feishu WS: event ignored (not a user message for this bot)");
+                }
+            }
+
+            // ACK every data frame
+            info!("Feishu WS: sending ACK for seq={}", frame.seq_id);
+            let ack = build_ack(frame.seq_id, &message_id);
+            let _ = write_tx.send(WsMessage::Binary(ack)).await;
+        }
+        _ => {}
+    }
+}
+
+// ─── Protobuf frame codec ────────────────────────────────────────────────────
+
+/// Decode a binary WebSocket message into a `pbbp2::Frame`.
+fn decode_frame(bytes: &[u8]) -> Result<feishu_proto::Frame, prost::DecodeError> {
+    <feishu_proto::Frame as ProstMessage>::decode(bytes)
+}
+
+/// Encode a `pbbp2::Frame` into binary for sending.
+fn encode_frame(frame: &feishu_proto::Frame) -> Vec<u8> {
+    let mut buf = Vec::new();
+    frame.encode(&mut buf).expect("prost encode is infallible");
+    buf
+}
+
+/// Build an ACK data frame (method=1, type=ack).
+fn build_ack(seq_id: u64, message_id: &str) -> Vec<u8> {
+    let payload = serde_json::json!({"code": 200, "data": message_id})
+        .to_string()
+        .into_bytes();
+    let frame = feishu_proto::Frame {
+        seq_id,
+        method: 1,
+        headers: vec![feishu_proto::Header {
+            key: "type".to_string(),
+            value: "ack".to_string(),
+        }],
+        payload,
+        ..Default::default()
+    };
+    encode_frame(&frame)
+}
+
+/// Build a pong control frame (method=0).
+fn build_pong(seq_id: u64) -> Vec<u8> {
+    let frame = feishu_proto::Frame {
+        seq_id,
+        method: 0,
+        headers: vec![feishu_proto::Header {
+            key: "type".to_string(),
+            value: "pong".to_string(),
+        }],
+        ..Default::default()
+    };
+    encode_frame(&frame)
+}
+
+/// Build a ping control frame (method=0) for the client-initiated heartbeat.
+fn build_ping() -> Vec<u8> {
+    let frame = feishu_proto::Frame {
+        method: 0,
+        headers: vec![feishu_proto::Header {
+            key: "type".to_string(),
+            value: "ping".to_string(),
+        }],
+        ..Default::default()
+    };
+    encode_frame(&frame)
+}
+
+/// Exponential backoff for WebSocket reconnect, capped at 60s.
+fn ws_backoff(attempt: u32) -> Duration {
+    let ms = (1000u64 * 2u64.saturating_pow(attempt.min(6))).min(60_000);
+    Duration::from_millis(ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1343,7 @@ mod tests {
             Some("verify-token".to_string()),
             Some("encrypt-key".to_string()),
             vec!["MyBot".to_string()],
+            "websocket".to_string(),
         );
         assert_eq!(adapter.name(), "lark");
         assert_eq!(
@@ -953,6 +1383,7 @@ mod tests {
             Some("verify-token".to_string()),
             Some("encrypt-key".to_string()),
             vec![],
+            "webhook".to_string(),
         );
         assert_eq!(adapter.verification_token, Some("verify-token".to_string()));
         assert_eq!(adapter.encrypt_key, Some("encrypt-key".to_string()));
@@ -1291,5 +1722,91 @@ mod tests {
 
         let msg = parse_event(&event, &[], "feishu").unwrap();
         assert_eq!(msg.thread_id, Some("om_root1".to_string()));
+    }
+
+    // ─── WebSocket codec tests ───────────────────────────────────────
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let original = feishu_proto::Frame {
+            seq_id: 42,
+            method: 1,
+            headers: vec![feishu_proto::Header {
+                key: "type".to_string(),
+                value: "event".to_string(),
+            }],
+            payload: b"hello world".to_vec(),
+            ..Default::default()
+        };
+        let bytes = encode_frame(&original);
+        let decoded = decode_frame(&bytes).expect("decode must succeed");
+        assert_eq!(decoded.seq_id, 42);
+        assert_eq!(decoded.method, 1);
+        assert_eq!(decoded.payload, b"hello world");
+        assert_eq!(decoded.headers[0].key, "type");
+        assert_eq!(decoded.headers[0].value, "event");
+    }
+
+    #[test]
+    fn test_build_ack_has_correct_header() {
+        let bytes = build_ack(7, "om_abc123");
+        let frame = decode_frame(&bytes).expect("decode ack");
+        assert_eq!(frame.seq_id, 7);
+        assert_eq!(frame.method, 1);
+        let type_header = frame.headers.iter().find(|h| h.key == "type");
+        assert_eq!(type_header.map(|h| h.value.as_str()), Some("ack"));
+        let payload: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(payload["code"], 200);
+        assert_eq!(payload["data"], "om_abc123");
+    }
+
+    #[test]
+    fn test_build_pong_is_control_frame() {
+        let bytes = build_pong(99);
+        let frame = decode_frame(&bytes).expect("decode pong");
+        assert_eq!(frame.seq_id, 99);
+        assert_eq!(frame.method, 0, "pong must be a control frame (method=0)");
+        let type_header = frame.headers.iter().find(|h| h.key == "type");
+        assert_eq!(type_header.map(|h| h.value.as_str()), Some("pong"));
+    }
+
+    #[test]
+    fn test_build_ping_is_control_frame() {
+        let bytes = build_ping();
+        let frame = decode_frame(&bytes).expect("decode ping");
+        assert_eq!(frame.method, 0, "ping must be a control frame (method=0)");
+        let type_header = frame.headers.iter().find(|h| h.key == "type");
+        assert_eq!(type_header.map(|h| h.value.as_str()), Some("ping"));
+    }
+
+    #[test]
+    fn test_ws_backoff_doubles_and_caps() {
+        assert_eq!(ws_backoff(0), Duration::from_millis(1000));
+        assert_eq!(ws_backoff(1), Duration::from_millis(2000));
+        assert_eq!(ws_backoff(2), Duration::from_millis(4000));
+        assert_eq!(ws_backoff(10), Duration::from_millis(60_000));
+        assert_eq!(ws_backoff(20), Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn test_connection_mode_default_is_websocket() {
+        let adapter = FeishuAdapter::new("id".into(), "secret".into(), 8453);
+        assert_eq!(adapter.connection_mode, "websocket");
+    }
+
+    #[test]
+    fn test_connection_mode_webhook_preserved() {
+        let adapter = FeishuAdapter::with_config(
+            "id".into(),
+            "secret".into(),
+            8453,
+            FeishuRegion::Cn,
+            None,
+            None,
+            None,
+            vec![],
+            "webhook".to_string(),
+        );
+        assert_eq!(adapter.connection_mode, "webhook");
     }
 }
